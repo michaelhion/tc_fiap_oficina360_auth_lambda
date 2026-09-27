@@ -1,7 +1,7 @@
 package com.techchallenger.oficina360;
 
-public record Client(
+public record User(
 		String document,
-		Boolean isActive
-) {
-}
+		Boolean isActive,
+		String role
+) {}

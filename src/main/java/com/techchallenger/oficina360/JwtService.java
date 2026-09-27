@@ -9,9 +9,11 @@ public class JwtService {
 
 	private final Algorithm algorithm;
 	private final long expirationSeconds;
+	private final String issuer;
 
-	public JwtService(String secret, long expirationSeconds) {
+	public JwtService(String secret, String issuer,long expirationSeconds) {
 		this.algorithm = Algorithm.HMAC256(secret);
+		this.issuer = issuer;
 		this.expirationSeconds = expirationSeconds;
 	}
 
@@ -20,8 +22,8 @@ public class JwtService {
 		Instant now = Instant.now();
 		Instant expiration = now.plusSeconds(expirationSeconds);
 		String token = JWT.create()
-				.withIssuer("customer-auth")
-				.withSubject(maskDocument(document))
+				.withIssuer(issuer)
+				.withSubject(document)
 				.withExpiresAt(expiration)
 				.sign(algorithm);
 		return new AuthResponse(
@@ -29,13 +31,5 @@ public class JwtService {
 			"Bearer",
 			expirationSeconds
 		);
-	}
-
-	private String maskDocument(String document) {
-		if (document == null || document.length() < 4) {
-			return "***";
-		}
-
-		return "***" + document.substring(document.length() - 4);
 	}
 }
