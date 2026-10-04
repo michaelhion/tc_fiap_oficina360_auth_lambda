@@ -15,7 +15,7 @@
         <aws-lambda-java-events.version>3.11.3</aws-lambda-java-events.version>
         <junit.version>5.10.0</junit.version>
         <mockito.version>5.2.0</mockito.version>
-        <postgresql.version>42.7.12</postgresql.version>
+        <postgresql.version>42.7.13</postgresql.version>
     </properties>
     <dependencies>
 
