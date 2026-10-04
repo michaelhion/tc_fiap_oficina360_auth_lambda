@@ -1,19 +1,19 @@
----
 name: CI/CD Lambda
 
 on:
-  push:
-    branches:
-      - main
-      - master
-      - develop
-      - release/*
-
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Lambda action"
+        required: true
+        type: choice
+        options:
+          - validate
+          - deploy
 
 env:
   JAVA_VERSION: "21"
-  AWS_REGION: "us-east-1"
+  AWS_REGION: us-east-1
   SAM_CLI_TELEMETRY: 0
 
 permissions:
@@ -22,7 +22,7 @@ permissions:
 jobs:
 
   # ============================================================
-  # 1. SECURITY: OWASP
+  # 1. SECURITY - OWASP
   # ============================================================
 
   security:
@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -40,21 +41,11 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven
 
-      # --------------------------------------------------------
-      # OWASP cache
-      # --------------------------------------------------------
-
-      - name: Get OWASP cache date
-        id: cache-date
-        run: |
-          echo "date=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
-
       - name: Restore OWASP cache
-        id: owasp-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: ~/.m2/repository/org/owasp/dependency-check-data
-          key: ${{ runner.os }}-owasp-${{ steps.cache-date.outputs.date }}
+          key: ${{ runner.os }}-owasp-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-owasp-
 
@@ -63,27 +54,17 @@ jobs:
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
 
-      # --------------------------------------------------------
-      # Save OWASP cache
-      # --------------------------------------------------------
-
-      - name: Save OWASP cache
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.m2/repository/org/owasp/dependency-check-data
-          key: ${{ runner.os }}-owasp-${{ steps.cache-date.outputs.date }}
-
 
   # ============================================================
-  # 2. BUILD + TEST + COVERAGE
+  # 2. BUILD + TEST + COVERAGE + SONARCLOUD
   # ============================================================
 
-  test:
-    name: Build, Tests and Coverage
+  quality:
+    name: Build, Tests, Coverage and SonarCloud
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -97,61 +78,17 @@ jobs:
       - name: Build and test
         run: mvn --no-transfer-progress clean verify
 
-      # --------------------------------------------------------
-      # Build artifact
-      # --------------------------------------------------------
-
       - name: Verify JAR
         run: |
           echo "Generated JAR:"
           ls -lh target/*.jar
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: lambda-build
-          path: |
-            target/*.jar
-            docs/security/jacoco/jacoco.xml
-
-
-  # ============================================================
-  # 3. SONARCLOUD
-  # ============================================================
-
-  sonar:
-    name: SonarCloud
-    needs:
-      - security
-      - test
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup Java
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
-          cache: maven
-
-      - name: Download build artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: lambda-build
-          path: .
-
-      - name: Verify JaCoCo report
+      - name: Verify JaCoCo
         run: |
-          echo "JaCoCo report:"
-          find . -name "jacoco.xml" -print
+          test -f docs/security/jacoco/jacoco.xml
 
-          echo ""
-          echo "JAR:"
-          ls -lh target/*.jar
+          echo "JaCoCo report:"
+          ls -lh docs/security/jacoco/jacoco.xml
 
       - name: SonarCloud
         env:
@@ -165,16 +102,19 @@ jobs:
 
 
   # ============================================================
-  # 4. SAM BUILD
+  # 3. SAM BUILD
   # ============================================================
 
   sam-build:
     name: SAM Build
-    needs: sonar
+    needs:
+      - security
+      - quality
 
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -195,29 +135,47 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sam-build
-          path: .aws-sam
+          path: .aws-sam/
+          if-no-files-found: error
+          retention-days: 1
 
 
   # ============================================================
-  # 5. DEPLOY HOMOLOGATION
+  # 4. VALIDATE
   # ============================================================
 
-  deploy-homolog:
-    name: Deploy Homologation
-    needs: sam-build
+  validate:
+    name: Validate Lambda
+    needs:
+      - security
+      - quality
+      - sam-build
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: inputs.action == 'validate'
 
     runs-on: ubuntu-latest
 
-    environment:
-      name: homologation
+    steps:
 
-    permissions:
-      id-token: write
-      contents: read
+      - name: Validation completed
+        run: |
+          echo "Lambda validation completed successfully."
+
+
+  # ============================================================
+  # 5. DEPLOY
+  # ============================================================
+
+  deploy:
+    name: Deploy Lambda
+    needs: sam-build
+
+    if: inputs.action == 'deploy'
+
+    runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -228,71 +186,30 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: sam-build
-          path: .aws-sam
+          path: .aws-sam/
+
+      # --------------------------------------------------------
+      # AWS Learner Lab credentials
+      # --------------------------------------------------------
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------------------
+      # Deploy
+      # --------------------------------------------------------
 
       - name: Deploy Lambda
         run: |
           sam deploy \
-            --stack-name oficina360-auth-homolog \
-            --region "${{ env.AWS_REGION }}" \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name oficina360-auth \
+            --region "$AWS_REGION" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --capabilities CAPABILITY_IAM \
-            --parameter-overrides \
-              Environment=homolog
-
-
-  # ============================================================
-  # 6. DEPLOY PRODUCTION
-  # ============================================================
-
-  deploy-production:
-    name: Deploy Production
-    needs: sam-build
-
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    runs-on: ubuntu-latest
-
-    environment:
-      name: production
-
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup AWS SAM
-        uses: aws-actions/setup-sam@v2
-
-      - name: Download SAM build
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: sam-build
-          path: .aws-sam
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6.3.0
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Deploy Lambda
-        run: |
-          sam deploy \
-            --stack-name oficina360-auth-prod \
-            --region "${{ env.AWS_REGION }}" \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --capabilities CAPABILITY_IAM \
-            --parameter-overrides \
-              Environment=prod
+            --capabilities CAPABILITY_IAM

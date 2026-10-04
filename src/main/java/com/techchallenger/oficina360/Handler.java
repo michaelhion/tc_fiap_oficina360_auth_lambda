@@ -66,7 +66,7 @@ public class Handler implements RequestHandler<APIGatewayProxyRequestEvent, APIG
 			return unauthorized("Cliente esta inativo");
 		}
 
-		AuthResponse authResponse = jwtService.generateToken(user.document());
+		AuthResponse authResponse = jwtService.generateToken(user);
 
 		return ok(authResponse);
 	}

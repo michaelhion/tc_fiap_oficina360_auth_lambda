@@ -2,18 +2,26 @@ package com.techchallenger.oficina360;
 
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.interfaces.DecodedJWT;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class JwtServiceTest {
 
+	private User user;
+
+	@BeforeEach
+	void setup(){
+		user = new User("12345678901",true,"teste");
+	}
+
 	@Test
 	void shouldGenerateaccessToken() {
 
 		JwtService jwtService = new JwtService("my-secret", "oficina360", 3600L);
 
-		AuthResponse response = jwtService.generateToken("12345678901");
+		AuthResponse response = jwtService.generateToken(user);
 
 		assertNotNull(response);
 		assertNotNull(response.accessToken());
@@ -25,7 +33,7 @@ class JwtServiceTest {
 
 		JwtService jwtService = new JwtService("my-secret", "oficina360", 3600L);
 
-		AuthResponse response = jwtService.generateToken("12345678901");
+		AuthResponse response = jwtService.generateToken(user);
 
 		assertEquals("Bearer", response.tokenType());
 	}
@@ -37,7 +45,7 @@ class JwtServiceTest {
 
 		JwtService jwtService = new JwtService("my-secret", "oficina360", expiration);
 
-		AuthResponse response = jwtService.generateToken("12345678901");
+		AuthResponse response = jwtService.generateToken(user);
 
 		assertEquals(expiration, response.expiresIn());
 	}
@@ -47,7 +55,7 @@ class JwtServiceTest {
 
 		JwtService jwtService = new JwtService("my-secret", "oficina360", 3600L);
 
-		AuthResponse response = jwtService.generateToken("12345678901");
+		AuthResponse response = jwtService.generateToken(user);
 
 		DecodedJWT jwt = JWT.decode(response.accessToken());
 
@@ -59,10 +67,10 @@ class JwtServiceTest {
 
 		JwtService jwtService = new JwtService("my-secret", "oficina360", 3600L);
 
-		AuthResponse response = jwtService.generateToken("12345678901");
+		AuthResponse response = jwtService.generateToken(user);
 
 		DecodedJWT jwt = JWT.decode(response.accessToken());
 
-		assertEquals("12345678901", jwt.getSubject());
+		assertEquals(user.document(), jwt.getSubject());
 	}
 }
