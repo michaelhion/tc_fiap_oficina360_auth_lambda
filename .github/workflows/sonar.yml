@@ -1,20 +1,16 @@
 name: CI/CD Lambda
 
 on:
-  workflow_dispatch:
-    inputs:
-      action:
-        description: "Lambda action"
-        required: true
-        type: choice
-        options:
-          - validate
-          - deploy
+  push:
+    branches:
+      - main
+      - master
+      - develop
+
+  pull_request:
 
 env:
   JAVA_VERSION: "21"
-  AWS_REGION: us-east-1
-  SAM_CLI_TELEMETRY: 0
 
 permissions:
   contents: read
@@ -85,10 +81,10 @@ jobs:
 
       - name: Verify JaCoCo
         run: |
-          test -f docs/security/jacoco/jacoco.xml
+          test -f target/site/jacoco/jacoco.xml
 
           echo "JaCoCo report:"
-          ls -lh docs/security/jacoco/jacoco.xml
+          ls -lh target/site/jacoco/jacoco.xml
 
       - name: SonarCloud
         env:
@@ -98,118 +94,4 @@ jobs:
             -Dsonar.projectKey=michaelhion_oficina360_lambda \
             -Dsonar.organization=michaelhion \
             -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.coverage.jacoco.xmlReportPaths=docs/security/jacoco/jacoco.xml
-
-
-  # ============================================================
-  # 3. SAM BUILD
-  # ============================================================
-
-  sam-build:
-    name: SAM Build
-    needs:
-      - security
-      - quality
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup Java
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
-          cache: maven
-
-      - name: Setup AWS SAM
-        uses: aws-actions/setup-sam@v2
-
-      - name: SAM Build
-        run: sam build
-
-      - name: Upload SAM build
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sam-build
-          path: .aws-sam/
-          if-no-files-found: error
-          retention-days: 1
-
-
-  # ============================================================
-  # 4. VALIDATE
-  # ============================================================
-
-  validate:
-    name: Validate Lambda
-    needs:
-      - security
-      - quality
-      - sam-build
-
-    if: inputs.action == 'validate'
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Validation completed
-        run: |
-          echo "Lambda validation completed successfully."
-
-
-  # ============================================================
-  # 5. DEPLOY
-  # ============================================================
-
-  deploy:
-    name: Deploy Lambda
-    needs: sam-build
-
-    if: inputs.action == 'deploy'
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup AWS SAM
-        uses: aws-actions/setup-sam@v2
-
-      - name: Download SAM build
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: sam-build
-          path: .aws-sam/
-
-      # --------------------------------------------------------
-      # AWS Learner Lab credentials
-      # --------------------------------------------------------
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      # --------------------------------------------------------
-      # Deploy
-      # --------------------------------------------------------
-
-      - name: Deploy Lambda
-        run: |
-          sam deploy \
-            --template-file .aws-sam/build/template.yaml \
-            --stack-name oficina360-auth \
-            --region "$AWS_REGION" \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --capabilities CAPABILITY_IAM
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
