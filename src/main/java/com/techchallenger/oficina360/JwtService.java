@@ -17,13 +17,14 @@ public class JwtService {
 		this.expirationSeconds = expirationSeconds;
 	}
 
-	public AuthResponse generateToken(String document) {
+	public AuthResponse generateToken(User user) {
 
 		Instant now = Instant.now();
 		Instant expiration = now.plusSeconds(expirationSeconds);
 		String token = JWT.create()
 				.withIssuer(issuer)
-				.withSubject(document)
+				.withSubject(user.document())
+				.withClaim("role", user.role())
 				.withExpiresAt(expiration)
 				.sign(algorithm);
 		return new AuthResponse(
