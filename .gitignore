@@ -33,4 +33,4 @@ build/
 .vscode/
 
 .aws-sam
-template.yaml
+.env

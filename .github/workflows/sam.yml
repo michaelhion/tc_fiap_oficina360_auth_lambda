@@ -4,39 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Lambda action"
+        description: Lambda action
         required: true
         type: choice
         options:
           - validate
           - deploy
-
-env:
-  JAVA_VERSION: "21"
-  AWS_REGION: us-east-1
-  SAM_CLI_TELEMETRY: 0
+          - destroy
 
 permissions:
   contents: read
 
+concurrency:
+  group: oficina360-lambda
+  cancel-in-progress: false
+
+env:
+  JAVA_VERSION: "21"
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: oficina360-auth
+  SAM_CLI_TELEMETRY: "0"
+
 jobs:
-
-  # ============================================================
-  # 1. SAM BUILD
-  # ============================================================
-
-  sam-build:
-    name: SAM Build
-
+  lambda:
+    name: Lambda ${{ inputs.action }}
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@v4
 
       - name: Setup Java
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        if: inputs.action != 'destroy'
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
@@ -45,86 +45,140 @@ jobs:
       - name: Setup AWS SAM
         uses: aws-actions/setup-sam@v2
 
-      - name: SAM Build
-        run: sam build
-
-      - name: Upload SAM build
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sam-build
-          path: .aws-sam/
-          if-no-files-found: error
-          retention-days: 1
-
-
-  # ============================================================
-  # 2. VALIDATE
-  # ============================================================
-
-  validate:
-    name: Validate Lambda
-    needs:
-      - sam-build
-
-    if: inputs.action == 'validate'
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Validation completed
-        run: |
-          echo "Lambda validation completed successfully."
-
-
-  # ============================================================
-  # 3. DEPLOY
-  # ============================================================
-
-  deploy:
-    name: Deploy Lambda
-    needs: sam-build
-
-    if: inputs.action == 'deploy'
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup AWS SAM
-        uses: aws-actions/setup-sam@v2
-
-      - name: Download SAM build
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: sam-build
-          path: .aws-sam/
-
-      # --------------------------------------------------------
-      # AWS Learner Lab credentials
-      # --------------------------------------------------------
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configurar credenciais AWS
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # --------------------------------------------------------
-      # Deploy
-      # --------------------------------------------------------
+      - name: Validar template SAM
+        if: inputs.action != 'destroy'
+        run: sam validate --lint
+
+      - name: Build Lambda
+        if: inputs.action != 'destroy'
+        run: sam build
 
       - name: Deploy Lambda
+        if: inputs.action == 'deploy'
+        env:
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
+          set -euo pipefail
+
+          DATABASE_HOST="$(aws ssm get-parameter \
+            --name '/oficina360/database/host' \
+            --query 'Parameter.Value' --output text)"
+
+          DATABASE_PORT="$(aws ssm get-parameter \
+            --name '/oficina360/database/port' \
+            --query 'Parameter.Value' --output text)"
+
+          DATABASE_NAME="$(aws ssm get-parameter \
+            --name '/oficina360/database/name' \
+            --query 'Parameter.Value' --output text)"
+
+          DATABASE_ACCESS_SG="$(aws ssm get-parameter \
+            --name '/oficina360/network/database-access-sg-id' \
+            --query 'Parameter.Value' --output text)"
+
+          SUBNET_IDS="$(aws ssm get-parameter \
+            --name '/oficina360/network/subnet-ids' \
+            --query 'Parameter.Value' --output text)"
+
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
-            --stack-name oficina360-auth \
+            --stack-name "$STACK_NAME" \
             --region "$AWS_REGION" \
+            --resolve-s3 \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --capabilities CAPABILITY_IAM
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+              DatabaseHost="$DATABASE_HOST" \
+              DatabasePort="$DATABASE_PORT" \
+              DatabaseName="$DATABASE_NAME" \
+              DatabaseUsername="$DB_USERNAME" \
+              DatabasePassword="$DB_PASSWORD" \
+              JwtSecret="$JWT_SECRET" \
+              JwtIssuer="oficina360-auth" \
+              JwtExpiration="3600" \
+              LambdaSecurityGroupId="$DATABASE_ACCESS_SG" \
+              LambdaSubnetIds="$SUBNET_IDS"
+
+          AUTH_API_URL="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='AuthApiUrl'].OutputValue | [0]" \
+            --output text)"
+
+          aws ssm put-parameter \
+            --name '/oficina360/auth/api-url' \
+            --type String \
+            --value "$AUTH_API_URL" \
+            --overwrite
+
+      - name: Mostrar outputs
+        if: inputs.action == 'deploy'
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs' \
+            --output table
+
+      - name: Destroy Lambda stack
+        if: inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          aws ssm delete-parameter \
+            --name '/oficina360/auth/api-url' || true
+
+          if aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+
+            aws cloudformation delete-stack \
+              --stack-name "$STACK_NAME" \
+              --region "$AWS_REGION"
+
+            aws cloudformation wait stack-delete-complete \
+              --stack-name "$STACK_NAME" \
+              --region "$AWS_REGION"
+          else
+            echo "Stack $STACK_NAME nao existe."
+          fi
+
+      - name: Gerar diagnostico
+        if: failure() && (inputs.action == 'deploy' || inputs.action == 'destroy')
+        run: |
+          {
+            echo '===== AWS IDENTITY ====='
+            aws sts get-caller-identity || true
+            echo
+            echo '===== STACK ====='
+            aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region "$AWS_REGION" || true
+            echo
+            echo '===== STACK EVENTS ====='
+            aws cloudformation describe-stack-events \
+              --stack-name "$STACK_NAME" \
+              --region "$AWS_REGION" \
+              --max-items 30 || true
+          } > lambda-diagnostics.txt 2>&1
+
+      - name: Publicar diagnostico
+        if: failure() && (inputs.action == 'deploy' || inputs.action == 'destroy')
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-diagnostics
+          path: lambda-diagnostics.txt
+          if-no-files-found: warn
+          retention-days: 1
