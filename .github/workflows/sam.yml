@@ -1,5 +1,7 @@
 name: SAM Lambda Deploy
 
+run-name: SAM Lambda - ${{ inputs.action }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -29,6 +31,7 @@ jobs:
   lambda:
     name: Lambda ${{ inputs.action }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -54,6 +57,12 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Validar identidade AWS
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
       - name: Validar template SAM
         if: inputs.action != 'destroy'
         run: sam validate --lint
@@ -65,31 +74,51 @@ jobs:
       - name: Deploy Lambda
         if: inputs.action == 'deploy'
         env:
+          DATABASE_HOST: ${{ vars.DATABASE_HOST }}
+          DATABASE_PORT: ${{ vars.DATABASE_PORT || '5432' }}
+          DATABASE_NAME: ${{ vars.DATABASE_NAME || 'oficina360' }}
+          LAMBDA_SECURITY_GROUP_ID: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
+          LAMBDA_SUBNET_IDS: ${{ vars.LAMBDA_SUBNET_IDS }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
           set -euo pipefail
 
-          DATABASE_HOST="$(aws ssm get-parameter \
-            --name '/oficina360/database/host' \
-            --query 'Parameter.Value' --output text)"
+          : "${DATABASE_HOST:?Repository Variable DATABASE_HOST nao definida}"
+          : "${DATABASE_PORT:?Repository Variable DATABASE_PORT nao definida}"
+          : "${DATABASE_NAME:?Repository Variable DATABASE_NAME nao definida}"
+          : "${LAMBDA_SECURITY_GROUP_ID:?Repository Variable LAMBDA_SECURITY_GROUP_ID nao definida}"
+          : "${LAMBDA_SUBNET_IDS:?Repository Variable LAMBDA_SUBNET_IDS nao definida}"
+          : "${DB_USERNAME:?GitHub Secret DB_USERNAME nao definido}"
+          : "${DB_PASSWORD:?GitHub Secret DB_PASSWORD nao definido}"
+          : "${JWT_SECRET:?GitHub Secret JWT_SECRET nao definido}"
 
-          DATABASE_PORT="$(aws ssm get-parameter \
-            --name '/oficina360/database/port' \
-            --query 'Parameter.Value' --output text)"
+          if [[ ! "$DATABASE_HOST" =~ \.rds\.amazonaws\.com$ ]]; then
+            echo "::error::DATABASE_HOST nao parece ser um endpoint RDS valido."
+            exit 1
+          fi
 
-          DATABASE_NAME="$(aws ssm get-parameter \
-            --name '/oficina360/database/name' \
-            --query 'Parameter.Value' --output text)"
+          if [[ ! "$DATABASE_PORT" =~ ^[0-9]+$ ]]; then
+            echo "::error::DATABASE_PORT deve ser numerica."
+            exit 1
+          fi
 
-          DATABASE_ACCESS_SG="$(aws ssm get-parameter \
-            --name '/oficina360/network/database-access-sg-id' \
-            --query 'Parameter.Value' --output text)"
+          if [[ ! "$LAMBDA_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
+            echo "::error::LAMBDA_SECURITY_GROUP_ID possui formato invalido."
+            exit 1
+          fi
 
-          SUBNET_IDS="$(aws ssm get-parameter \
-            --name '/oficina360/network/subnet-ids' \
-            --query 'Parameter.Value' --output text)"
+          if [[ ! "$LAMBDA_SUBNET_IDS" =~ ^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)*$ ]]; then
+            echo "::error::LAMBDA_SUBNET_IDS deve usar o formato subnet-aaa,subnet-bbb."
+            exit 1
+          fi
+
+          echo "Database host: $DATABASE_HOST"
+          echo "Database port: $DATABASE_PORT"
+          echo "Database name: $DATABASE_NAME"
+          echo "Security Group: $LAMBDA_SECURITY_GROUP_ID"
+          echo "Subnets: $LAMBDA_SUBNET_IDS"
 
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
@@ -108,20 +137,29 @@ jobs:
               JwtSecret="$JWT_SECRET" \
               JwtIssuer="oficina360-auth" \
               JwtExpiration="3600" \
-              LambdaSecurityGroupId="$DATABASE_ACCESS_SG" \
-              LambdaSubnetIds="$SUBNET_IDS"
+              LambdaSecurityGroupId="$LAMBDA_SECURITY_GROUP_ID" \
+              LambdaSubnetIds="$LAMBDA_SUBNET_IDS"
 
-          AUTH_API_URL="$(aws cloudformation describe-stacks \
-            --stack-name "$STACK_NAME" \
-            --region "$AWS_REGION" \
-            --query "Stacks[0].Outputs[?OutputKey=='AuthApiUrl'].OutputValue | [0]" \
-            --output text)"
+      - name: Obter URL da API
+        if: inputs.action == 'deploy'
+        run: |
+          set -euo pipefail
 
-          aws ssm put-parameter \
-            --name '/oficina360/auth/api-url' \
-            --type String \
-            --value "$AUTH_API_URL" \
-            --overwrite
+          AUTH_API_URL="$(
+            aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region "$AWS_REGION" \
+              --query "Stacks[0].Outputs[?OutputKey=='AuthApiUrl'].OutputValue | [0]" \
+              --output text
+          )"
+
+          if [[ -z "$AUTH_API_URL" || "$AUTH_API_URL" == "None" ]]; then
+            echo "::error::Output AuthApiUrl nao encontrado."
+            exit 1
+          fi
+
+          echo "AUTH_API_URL=$AUTH_API_URL" >> "$GITHUB_ENV"
+          echo "API Gateway URL: $AUTH_API_URL"
 
       - name: Mostrar outputs
         if: inputs.action == 'deploy'
@@ -132,17 +170,33 @@ jobs:
             --query 'Stacks[0].Outputs' \
             --output table
 
+      - name: Gerar resumo do deploy
+        if: inputs.action == 'deploy'
+        run: |
+          {
+            echo "STACK_NAME=$STACK_NAME"
+            echo "AUTH_API_URL=$AUTH_API_URL"
+            echo "AWS_REGION=$AWS_REGION"
+          } | tee lambda-deploy-summary.txt
+
+      - name: Publicar resumo do deploy
+        if: inputs.action == 'deploy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-deploy-summary
+          path: lambda-deploy-summary.txt
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Destroy Lambda stack
         if: inputs.action == 'destroy'
         run: |
           set -euo pipefail
 
-          aws ssm delete-parameter \
-            --name '/oficina360/auth/api-url' || true
-
           if aws cloudformation describe-stacks \
             --stack-name "$STACK_NAME" \
-            --region "$AWS_REGION" >/dev/null 2>&1; then
+            --region "$AWS_REGION" \
+            >/dev/null 2>&1; then
 
             aws cloudformation delete-stack \
               --stack-name "$STACK_NAME" \
@@ -161,11 +215,13 @@ jobs:
           {
             echo '===== AWS IDENTITY ====='
             aws sts get-caller-identity || true
+
             echo
             echo '===== STACK ====='
             aws cloudformation describe-stacks \
               --stack-name "$STACK_NAME" \
               --region "$AWS_REGION" || true
+
             echo
             echo '===== STACK EVENTS ====='
             aws cloudformation describe-stack-events \
