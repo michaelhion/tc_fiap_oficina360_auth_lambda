@@ -31,7 +31,7 @@ jobs:
   lambda:
     name: Lambda ${{ inputs.action }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -61,7 +61,25 @@ jobs:
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
         run: |
           set -euo pipefail
-          aws sts get-caller-identity
+
+          ACCOUNT_ID="$(
+            aws sts get-caller-identity \
+              --query Account \
+              --output text
+          )"
+
+          : "${ACCOUNT_ID:?Conta AWS nao identificada}"
+
+          SAM_ARTIFACTS_BUCKET="oficina360-sam-${ACCOUNT_ID}-${AWS_REGION}"
+          SAM_ARTIFACTS_PREFIX="sam/${STACK_NAME}"
+
+          echo "AWS_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "SAM_ARTIFACTS_BUCKET=$SAM_ARTIFACTS_BUCKET" >> "$GITHUB_ENV"
+          echo "SAM_ARTIFACTS_PREFIX=$SAM_ARTIFACTS_PREFIX" >> "$GITHUB_ENV"
+
+          echo "Conta AWS: $ACCOUNT_ID"
+          echo "Bucket SAM: $SAM_ARTIFACTS_BUCKET"
+          echo "Prefixo SAM: $SAM_ARTIFACTS_PREFIX"
 
       - name: Validar template SAM
         if: inputs.action != 'destroy'
@@ -70,6 +88,59 @@ jobs:
       - name: Build Lambda
         if: inputs.action != 'destroy'
         run: sam build
+
+      - name: Preparar bucket de artefatos SAM
+        if: inputs.action == 'deploy'
+        run: |
+          set -euo pipefail
+
+          : "${SAM_ARTIFACTS_BUCKET:?Bucket SAM nao calculado}"
+          : "${SAM_ARTIFACTS_PREFIX:?Prefixo SAM nao calculado}"
+
+          if aws s3api head-bucket \
+            --bucket "$SAM_ARTIFACTS_BUCKET" \
+            >/dev/null 2>&1; then
+
+            echo "Bucket SAM existente: $SAM_ARTIFACTS_BUCKET"
+          else
+            echo "Bucket SAM ausente ou inacessivel. Tentando criar..."
+
+            if [[ "$AWS_REGION" == "us-east-1" ]]; then
+              aws s3api create-bucket \
+                --bucket "$SAM_ARTIFACTS_BUCKET" \
+                --region "$AWS_REGION"
+            else
+              aws s3api create-bucket \
+                --bucket "$SAM_ARTIFACTS_BUCKET" \
+                --region "$AWS_REGION" \
+                --create-bucket-configuration \
+                  "LocationConstraint=$AWS_REGION"
+            fi
+          fi
+
+          aws s3api put-public-access-block \
+            --bucket "$SAM_ARTIFACTS_BUCKET" \
+            --public-access-block-configuration \
+              'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+          TEST_FILE="$(mktemp)"
+          trap 'rm -f "$TEST_FILE"' EXIT
+          printf 'sam-access-test\n' > "$TEST_FILE"
+
+          TEST_KEY="${SAM_ARTIFACTS_PREFIX}/access-test-${GITHUB_RUN_ID}.txt"
+
+          aws s3api put-object \
+            --bucket "$SAM_ARTIFACTS_BUCKET" \
+            --key "$TEST_KEY" \
+            --body "$TEST_FILE" \
+            >/dev/null
+
+          aws s3api delete-object \
+            --bucket "$SAM_ARTIFACTS_BUCKET" \
+            --key "$TEST_KEY" \
+            >/dev/null
+
+          echo "Bucket SAM criado/validado com escrita e exclusao."
 
       - name: Deploy Lambda
         if: inputs.action == 'deploy'
@@ -93,6 +164,8 @@ jobs:
           : "${DB_USERNAME:?GitHub Secret DB_USERNAME nao definido}"
           : "${DB_PASSWORD:?GitHub Secret DB_PASSWORD nao definido}"
           : "${JWT_SECRET:?GitHub Secret JWT_SECRET nao definido}"
+          : "${SAM_ARTIFACTS_BUCKET:?Bucket SAM nao preparado}"
+          : "${SAM_ARTIFACTS_PREFIX:?Prefixo SAM nao preparado}"
 
           if [[ ! "$DATABASE_HOST" =~ \.rds\.amazonaws\.com$ ]]; then
             echo "::error::DATABASE_HOST nao parece ser um endpoint RDS valido."
@@ -110,7 +183,7 @@ jobs:
           fi
 
           if [[ ! "$LAMBDA_SUBNET_IDS" =~ ^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)*$ ]]; then
-            echo "::error::LAMBDA_SUBNET_IDS deve usar o formato subnet-aaa,subnet-bbb."
+            echo "::error::LAMBDA_SUBNET_IDS deve usar subnet-aaa,subnet-bbb."
             exit 1
           fi
 
@@ -119,12 +192,14 @@ jobs:
           echo "Database name: $DATABASE_NAME"
           echo "Security Group: $LAMBDA_SECURITY_GROUP_ID"
           echo "Subnets: $LAMBDA_SUBNET_IDS"
+          echo "Bucket de artefatos: $SAM_ARTIFACTS_BUCKET"
 
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
             --stack-name "$STACK_NAME" \
             --region "$AWS_REGION" \
-            --resolve-s3 \
+            --s3-bucket "$SAM_ARTIFACTS_BUCKET" \
+            --s3-prefix "$SAM_ARTIFACTS_PREFIX" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --capabilities CAPABILITY_IAM \
@@ -177,6 +252,8 @@ jobs:
             echo "STACK_NAME=$STACK_NAME"
             echo "AUTH_API_URL=$AUTH_API_URL"
             echo "AWS_REGION=$AWS_REGION"
+            echo "SAM_ARTIFACTS_BUCKET=$SAM_ARTIFACTS_BUCKET"
+            echo "SAM_ARTIFACTS_PREFIX=$SAM_ARTIFACTS_PREFIX"
           } | tee lambda-deploy-summary.txt
 
       - name: Publicar resumo do deploy
@@ -209,6 +286,40 @@ jobs:
             echo "Stack $STACK_NAME nao existe."
           fi
 
+      - name: Limpar bucket SAM
+        if: inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          if ! aws s3api head-bucket \
+            --bucket "$SAM_ARTIFACTS_BUCKET" \
+            >/dev/null 2>&1; then
+
+            echo "Bucket SAM nao existe ou nao esta acessivel."
+            exit 0
+          fi
+
+          aws s3 rm \
+            "s3://${SAM_ARTIFACTS_BUCKET}/${SAM_ARTIFACTS_PREFIX}/" \
+            --recursive || true
+
+          REMAINING_OBJECTS="$(
+            aws s3api list-objects-v2 \
+              --bucket "$SAM_ARTIFACTS_BUCKET" \
+              --query 'KeyCount' \
+              --output text
+          )"
+
+          if [[ "$REMAINING_OBJECTS" == "0" ]]; then
+            aws s3api delete-bucket \
+              --bucket "$SAM_ARTIFACTS_BUCKET" \
+              --region "$AWS_REGION"
+
+            echo "Bucket SAM vazio removido."
+          else
+            echo "Bucket SAM possui outros objetos e foi preservado."
+          fi
+
       - name: Gerar diagnostico
         if: failure() && (inputs.action == 'deploy' || inputs.action == 'destroy')
         run: |
@@ -228,6 +339,21 @@ jobs:
               --stack-name "$STACK_NAME" \
               --region "$AWS_REGION" \
               --max-items 30 || true
+
+            echo
+            echo '===== BUCKET SAM ====='
+            echo "bucket=${SAM_ARTIFACTS_BUCKET:-nao-calculado}"
+            echo "prefix=${SAM_ARTIFACTS_PREFIX:-nao-calculado}"
+
+            if [[ -n "${SAM_ARTIFACTS_BUCKET:-}" ]]; then
+              aws s3api get-bucket-location \
+                --bucket "$SAM_ARTIFACTS_BUCKET" || true
+
+              aws s3api list-objects-v2 \
+                --bucket "$SAM_ARTIFACTS_BUCKET" \
+                --prefix "${SAM_ARTIFACTS_PREFIX:-}" \
+                --max-items 20 || true
+            fi
           } > lambda-diagnostics.txt 2>&1
 
       - name: Publicar diagnostico
