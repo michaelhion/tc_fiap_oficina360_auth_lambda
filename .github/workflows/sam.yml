@@ -1,4 +1,4 @@
-name: CI/CD Lambda
+name: SAM Lambda Deploy
 
 on:
   workflow_dispatch:
